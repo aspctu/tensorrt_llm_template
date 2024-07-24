@@ -54,36 +54,38 @@ class TritonPythonModel:
           * model_name: Model name
         """
         # Parse model configs
-        model_config = json.loads(args["model_config"])
+        model_config = json.loads(args['model_config'])
         tokenizer_dir = os.environ["TRITON_TOKENIZER_REPOSITORY"]
         hf_auth_token = os.environ.get("HUGGING_FACE_HUB_TOKEN", None)
+        self.add_special_tokens = True
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_dir,
-            legacy=False,
-            padding_side="left",
-            trust_remote_code=True,
-            token=hf_auth_token,
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                                       legacy=False,
+                                                       padding_side='left',
+                                                       trust_remote_code=True,
+                                                       token=hf_auth_token)
         if isinstance(self.tokenizer, T5Tokenizer):
             self.tokenizer_bos_id = self.tokenizer.sp_model.bos_id()
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if not self.tokenizer.pad_token:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.tokenizer_end_id = self.tokenizer.encode(
-            self.tokenizer.eos_token, add_special_tokens=False
-        )[0]
+            self.tokenizer.eos_token, add_special_tokens=False)[0]
         self.tokenizer_pad_id = self.tokenizer.encode(
-            self.tokenizer.pad_token, add_special_tokens=False
-        )[0]
+            self.tokenizer.pad_token, add_special_tokens=False)[0]
+
+        self.visual_engine = None
+        self.visual_context = None
+        self.stream = None
+        self.vocab_size = None
+        self.dtype = None
 
         # Parse model output configs and convert Triton types to numpy types
         output_names = [
-            "INPUT_ID",
-            "REQUEST_INPUT_LEN",
-            "BAD_WORDS_IDS",
-            "STOP_WORDS_IDS",
-            "OUT_END_ID",
-            "OUT_PAD_ID",
+            "INPUT_ID", "DECODER_INPUT_ID", "REQUEST_INPUT_LEN",
+            "REQUEST_DECODER_INPUT_LEN", "BAD_WORDS_IDS", "STOP_WORDS_IDS",
+            "OUT_END_ID", "OUT_PAD_ID", "OUT_PROMPT_EMBEDDING_TABLE"
         ]
         input_names = ["EMBEDDING_BIAS_WORDS", "EMBEDDING_BIAS_WEIGHTS"]
         for input_name in input_names:
@@ -91,22 +93,16 @@ class TritonPythonModel:
                 self,
                 input_name.lower() + "_dtype",
                 pb_utils.triton_string_to_numpy(
-                    pb_utils.get_input_config_by_name(model_config, input_name)[
-                        "data_type"
-                    ]
-                ),
-            )
+                    pb_utils.get_input_config_by_name(
+                        model_config, input_name)['data_type']))
 
         for output_name in output_names:
             setattr(
                 self,
                 output_name.lower() + "_dtype",
                 pb_utils.triton_string_to_numpy(
-                    pb_utils.get_output_config_by_name(model_config, output_name)[
-                        "data_type"
-                    ]
-                ),
-            )
+                    pb_utils.get_output_config_by_name(
+                        model_config, output_name)['data_type']))
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`
@@ -135,109 +131,130 @@ class TritonPythonModel:
         logger = pb_utils.Logger
         for idx, request in enumerate(requests):
             # Get input tensors
-            query = pb_utils.get_input_tensor_by_name(request, "QUERY").as_numpy()
-            batch_dim = query.shape[0]
-            if batch_dim != 1:
-                err_str = (
-                    "Inflight batching backend expects requests with batch size of 1."
-                )
-                logger.log_error(err_str)
-                responses.append(
-                    pb_utils.InferenceResponse(
-                        output_tensors=[], error=pb_utils.TritonError(err_str)
-                    )
-                )
-                continue
+            query = pb_utils.get_input_tensor_by_name(request,
+                                                      'QUERY').as_numpy()
+            batch_size = query.shape[0]
 
+            decoder_query = pb_utils.get_input_tensor_by_name(
+                request, 'DECODER_QUERY')
+            if decoder_query is not None:
+                decoder_query = decoder_query.as_numpy()
+
+            image = None
             request_output_len = pb_utils.get_input_tensor_by_name(
-                request, "REQUEST_OUTPUT_LEN"
-            ).as_numpy()
+                request, 'REQUEST_OUTPUT_LEN').as_numpy()
 
             bad_words_dict = pb_utils.get_input_tensor_by_name(
-                request, "BAD_WORDS_DICT"
-            )
+                request, 'BAD_WORDS_DICT')
             if bad_words_dict is not None:
                 bad_words_dict = bad_words_dict.as_numpy()
 
             stop_words_dict = pb_utils.get_input_tensor_by_name(
-                request, "STOP_WORDS_DICT"
-            )
+                request, 'STOP_WORDS_DICT')
             if stop_words_dict is not None:
                 stop_words_dict = stop_words_dict.as_numpy()
 
             embedding_bias_words = pb_utils.get_input_tensor_by_name(
-                request, "EMBEDDING_BIAS_WORDS"
-            )
+                request, 'EMBEDDING_BIAS_WORDS')
             if embedding_bias_words is not None:
                 embedding_bias_words = embedding_bias_words.as_numpy()
 
             embedding_bias_weights = pb_utils.get_input_tensor_by_name(
-                request, "EMBEDDING_BIAS_WEIGHTS"
-            )
+                request, 'EMBEDDING_BIAS_WEIGHTS')
             if embedding_bias_weights is not None:
                 embedding_bias_weights = embedding_bias_weights.as_numpy()
 
+            prompt_embedding_table_tensor = pb_utils.get_input_tensor_by_name(
+                request, 'PROMPT_EMBEDDING_TABLE')
+            if prompt_embedding_table_tensor is not None:
+                prompt_embedding_table = prompt_embedding_table_tensor.as_numpy(
+                )
+                prompt_embedding_table_tensor = pb_utils.Tensor(
+                    'OUT_PROMPT_EMBEDDING_TABLE', prompt_embedding_table)
+
+            visual_output = None
+
             # Take the end_id from the input tensors
             # If not specified, use tokenizer to get end_id
-            end_id = pb_utils.get_input_tensor_by_name(request, "END_ID")
+            end_id = pb_utils.get_input_tensor_by_name(request, 'END_ID')
             if end_id is not None:
                 end_id = end_id.as_numpy()
             else:
-                end_id = [[self.tokenizer_end_id]]
+                end_id = [[self.tokenizer_end_id]] * batch_size
 
             # Take the pad_id from the input tensors
             # If not specified, use tokenizer to get pad_id
-            pad_id = pb_utils.get_input_tensor_by_name(request, "PAD_ID")
+            pad_id = pb_utils.get_input_tensor_by_name(request, 'PAD_ID')
             if pad_id is not None:
                 pad_id = pad_id.as_numpy()
             else:
-                pad_id = [[self.tokenizer_pad_id]]
+                pad_id = [[self.tokenizer_pad_id]] * batch_size
 
             # Preprocessing input data.
-            input_id, request_input_len = self._create_request(query)
-            bad_words = self._to_word_list_format(bad_words_dict)
-            stop_words = self._to_word_list_format(stop_words_dict)
+            input_id, request_input_len = self._create_request(
+                query, visual_output)
+            if decoder_query is not None:
+                decoder_input_id, request_decoder_input_len = self._create_request(
+                    decoder_query)
+            else:
+                decoder_input_id = pad_id * np.ones((batch_size, 1), np.int32)
+                request_decoder_input_len = 1 * np.ones(
+                    (batch_size, 1), np.int32)
+
+            bad_words = self._to_word_list_format(bad_words_dict, batch_size)
+            stop_words = self._to_word_list_format(stop_words_dict, batch_size)
 
             embedding_bias = self._get_embedding_bias(
-                embedding_bias_words,
-                embedding_bias_weights,
-                self.embedding_bias_weights_dtype,
-            )
+                embedding_bias_words, embedding_bias_weights,
+                self.embedding_bias_weights_dtype, batch_size)
 
             # Create output tensors. You need pb_utils.Tensor
             # objects to create pb_utils.InferenceResponse.
             input_id_tensor = pb_utils.Tensor(
-                "INPUT_ID", input_id.astype(self.input_id_dtype)
-            )
+                'INPUT_ID', input_id.astype(self.input_id_dtype))
             request_input_len_tensor = pb_utils.Tensor(
-                "REQUEST_INPUT_LEN",
-                request_input_len.astype(self.request_input_len_dtype),
-            )
+                'REQUEST_INPUT_LEN',
+                request_input_len.astype(self.request_input_len_dtype))
+            decoder_input_id_tensor = pb_utils.Tensor(
+                'DECODER_INPUT_ID',
+                decoder_input_id.astype(self.decoder_input_id_dtype))
+            request_decoder_input_len_tensor = pb_utils.Tensor(
+                'REQUEST_DECODER_INPUT_LEN',
+                request_decoder_input_len.astype(
+                    self.request_decoder_input_len_dtype))
             request_output_len_tensor = pb_utils.Tensor(
-                "REQUEST_OUTPUT_LEN", request_output_len
-            )
-            bad_words_ids_tensor = pb_utils.Tensor("BAD_WORDS_IDS", bad_words)
-            stop_words_ids_tensor = pb_utils.Tensor("STOP_WORDS_IDS", stop_words)
-            embedding_bias_tensor = pb_utils.Tensor("EMBEDDING_BIAS", embedding_bias)
-            end_id_tensor = pb_utils.Tensor(
-                "OUT_END_ID", np.array(end_id, dtype=np.int32)
-            )
-            pad_id_tensor = pb_utils.Tensor(
-                "OUT_PAD_ID", np.array(pad_id, dtype=np.int32)
-            )
+                'REQUEST_OUTPUT_LEN', request_output_len)
+            bad_words_ids_tensor = pb_utils.Tensor('BAD_WORDS_IDS', bad_words)
+            stop_words_ids_tensor = pb_utils.Tensor('STOP_WORDS_IDS',
+                                                    stop_words)
+            embedding_bias_tensor = pb_utils.Tensor('EMBEDDING_BIAS',
+                                                    embedding_bias)
+            end_id_tensor = pb_utils.Tensor('OUT_END_ID',
+                                            np.array(end_id, dtype=np.int32))
+            pad_id_tensor = pb_utils.Tensor('OUT_PAD_ID',
+                                            np.array(pad_id, dtype=np.int32))
 
-            inference_response = pb_utils.InferenceResponse(
-                output_tensors=[
-                    input_id_tensor,
-                    bad_words_ids_tensor,
-                    stop_words_ids_tensor,
-                    request_input_len_tensor,
-                    request_output_len_tensor,
-                    embedding_bias_tensor,
-                    end_id_tensor,
-                    pad_id_tensor,
-                ]
-            )
+            if prompt_embedding_table_tensor is not None:
+                inference_response = pb_utils.InferenceResponse(
+                    output_tensors=[
+                        input_id_tensor, decoder_input_id_tensor,
+                        bad_words_ids_tensor, stop_words_ids_tensor,
+                        request_input_len_tensor,
+                        request_decoder_input_len_tensor,
+                        request_output_len_tensor, embedding_bias_tensor,
+                        end_id_tensor, pad_id_tensor,
+                        prompt_embedding_table_tensor
+                    ])
+            else:
+                inference_response = pb_utils.InferenceResponse(
+                    output_tensors=[
+                        input_id_tensor, decoder_input_id_tensor,
+                        bad_words_ids_tensor, stop_words_ids_tensor,
+                        request_input_len_tensor,
+                        request_decoder_input_len_tensor,
+                        request_output_len_tensor, embedding_bias_tensor,
+                        end_id_tensor, pad_id_tensor
+                    ])
             responses.append(inference_response)
 
         # You should return a list of pb_utils.InferenceResponse. Length
@@ -249,58 +266,60 @@ class TritonPythonModel:
         Implementing `finalize` function is optional. This function allows
         the model to perform any necessary clean ups before exit.
         """
-        print("Cleaning up...")
+        print('Cleaning up...')
 
-    def _create_request(self, query):
+    def _create_request(self, query, visual_features):
         """
-        query : batch string (2D numpy array)
+            query : batch string (2D numpy array)
         """
         if isinstance(self.tokenizer, T5Tokenizer):
             start_ids = [
-                np.array(
-                    [self.tokenizer_bos_id]
-                    + self.tokenizer.encode(s[0].decode(), add_special_tokens=False)
-                ).astype(int)
-                for s in query
+                np.array([self.tokenizer_bos_id] + self.tokenizer.encode(
+                    s[0].decode(), add_special_tokens=self.add_special_tokens)
+                         ).astype(int) for s in query
             ]
         else:
             start_ids = [
                 np.array(
-                    self.tokenizer.encode(s[0].decode(), add_special_tokens=False)
-                ).astype(int)
-                for s in query
+                    self.tokenizer.encode(
+                        s[0].decode(),
+                        add_special_tokens=self.add_special_tokens)).astype(
+                            int) for s in query
             ]
+        if visual_features is not None:
+            fake_prompt_id = np.arange(
+                self.vocab_size, self.vocab_size + visual_features.shape[1])
+            start_ids = [
+                np.concatenate((fake_prompt_id, ids), axis=0)
+                for ids in start_ids
+            ]
+
         start_lengths = np.array([[len(ids)] for ids in start_ids]).astype(int)
 
         max_len = 0
         for seq in start_ids:
             max_len = max(max_len, seq.shape[0])
-        start_ids = np.stack(
-            [
-                np.pad(
-                    seq,
-                    (0, max_len - seq.shape[0]),
-                    "constant",
-                    constant_values=(0, self.tokenizer_pad_id),
-                )
-                for seq in start_ids
-            ]
-        )
+        start_ids = np.stack([
+            np.pad(seq, (0, max_len - seq.shape[0]),
+                   'constant',
+                   constant_values=(0, self.tokenizer_pad_id))
+            for seq in start_ids
+        ])
 
         return start_ids, start_lengths
 
-    def _to_word_list_format(self, word_lists: List[List[str | bytes]]):
-        """
+    def _to_word_list_format(self, word_lists: List[List[str | bytes]],
+                             batch_size):
+        '''
         word_lists format:
             len(word_lists) == batch_size
-            word_lists[i] means the words associated to batch item i.
-            A "word" may actually be any string. Like "lorem" or "lorem ipsum".
-        """
-        assert self.tokenizer is not None, "need to set tokenizer"
+            word_lists[i] means the words associated to batch item i. A "word" may actually be any string. Like "lorem" or "lorem ipsum".
+        '''
+        assert self.tokenizer != None, "need to set tokenizer"
 
         if word_lists is None:
             # Return an empty array of shape (1,2,0)
-            return np.empty([1, 2, 0], dtype="int32")
+            return np.empty([batch_size, 2, 0], dtype="int32")
 
         flat_ids = []
         offsets = []
@@ -325,23 +344,29 @@ class TritonPythonModel:
         pad_to = max(1, max(len(ids) for ids in flat_ids))
 
         for i, (ids, offs) in enumerate(zip(flat_ids, offsets)):
-            flat_ids[i] = np.pad(ids, (0, pad_to - len(ids)), constant_values=0)
-            offsets[i] = np.pad(offs, (0, pad_to - len(offs)), constant_values=-1)
+            flat_ids[i] = np.pad(ids, (0, pad_to - len(ids)),
+                                 constant_values=0)
+            offsets[i] = np.pad(offs, (0, pad_to - len(offs)),
+                                constant_values=-1)
 
-        return np.array([flat_ids, offsets], dtype="int32").transpose((1, 0, 2))
+        return np.array([flat_ids, offsets], dtype="int32").transpose(
+            (1, 0, 2))
 
-    def _get_embedding_bias(
-        self, embedding_bias_words, embedding_bias_weights, bias_dtype
-    ):
-        assert self.tokenizer is not None, "need to set tokenizer"
+    def _get_embedding_bias(self, embedding_bias_words, embedding_bias_weights,
+                            bias_dtype, batch_size):
+
+        assert self.tokenizer != None, "need to set tokenizer"
 
         if embedding_bias_words is None or embedding_bias_weights is None:
-            return np.empty([1, 0], dtype=self.embedding_bias_weights_dtype)
+            return np.empty([batch_size, 0],
+                            dtype=self.embedding_bias_weights_dtype)
 
         batch_embedding_bias = []
-        for words, weights in zip(embedding_bias_words, embedding_bias_weights):
+        for words, weights in zip(embedding_bias_words,
+                                  embedding_bias_weights):
+
             vocab_size = self.tokenizer.vocab_size
-            embedding_bias = [0.0] * vocab_size
+            embedding_bias = [0.] * vocab_size
 
             assert len(words) == len(
                 weights
