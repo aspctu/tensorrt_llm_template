@@ -1,4 +1,4 @@
-# Copyright 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -25,15 +25,10 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import json
-import os
-from collections import OrderedDict
 
 import numpy as np
 import triton_python_backend_utils as pb_utils
 from transformers import AutoTokenizer
-
-# https://github.com/huggingface/tokenizers/blob/main/tokenizers/src/decoders/strip.rs#L8
-INVALID_UNICODE_CHAR = "�"
 
 
 class TritonPythonModel:
@@ -57,28 +52,26 @@ class TritonPythonModel:
           * model_name: Model name
         """
         # Parse model configs
-        model_config = json.loads(args["model_config"])
-        # NOTE: Keep this in sync with the truss model.py variable
         tokenizer_dir = os.environ["TRITON_TOKENIZER_REPOSITORY"]
         hf_auth_token = os.environ.get("HUGGING_FACE_HUB_TOKEN", None)
+        model_config = json.loads(args['model_config'])
+        self.skip_special_tokens = True
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_dir,
-            legacy=False,
-            padding_side="left",
-            trust_remote_code=True,
-            token=hf_auth_token,
-        )
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                                       legacy=False,
+                                                       padding_side='left',
+                                                       trust_remote_code=True,
+                                                       token=hf_auth_token)
+        if not self.tokenizer.pad_token:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Parse model output configs
-        output_config = pb_utils.get_output_config_by_name(model_config, "OUTPUT")
-        # Convert Triton types to numpy types
-        self.output_dtype = pb_utils.triton_string_to_numpy(output_config["data_type"])
+        output_config = pb_utils.get_output_config_by_name(
+            model_config, "OUTPUT")
 
-        self.state_dict = OrderedDict()
-        # TODO(pankaj) This should come from the batch size
-        self.cache_size = 2048
+        # Convert Triton types to numpy types
+        self.output_dtype = pb_utils.triton_string_to_numpy(
+            output_config['data_type'])
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`
@@ -105,160 +98,133 @@ class TritonPythonModel:
         # Every Python backend must iterate over everyone of the requests
         # and create a pb_utils.InferenceResponse for each of them.
         for idx, request in enumerate(requests):
-            # Get request ID
-            request_id = request.request_id()
-
             # Get input tensors
-            tokens_batch = (
-                pb_utils.get_input_tensor_by_name(request, "TOKENS_BATCH")
-                .as_numpy()
-                .flatten()
-            )
+            tokens_batch = pb_utils.get_input_tensor_by_name(
+                request, 'TOKENS_BATCH').as_numpy()
 
-            if len(tokens_batch) == 0:
-                continue
-
-            # Postprocess output data
-            prev_token = self._get_var(request_id, "prev_token")
-            token_buffer = self._get_var(request_id, "token_buffer")
-            token_buffer = token_buffer if token_buffer is not None else []
-            current_tokens = np.concatenate(
-                (np.array(token_buffer, dtype=int), tokens_batch), dtype=int
-            )
-            current_tokens_decoded = self.tokenizer.decode(current_tokens)
-
-            if len(current_tokens_decoded) == 0:
-                responses.append(pb_utils.InferenceResponse())
-                continue
-
-            if current_tokens_decoded[-1] == INVALID_UNICODE_CHAR:
-                # If the last token is invalid, we need to keep it in the buffer
-                # for the next request to see if this is a multi-token unicode
-                # character.
-                self._store_var(request_id, "token_buffer", current_tokens)
-                responses.append(pb_utils.InferenceResponse())
-                continue
-
-            if prev_token is None:
-                delta = current_tokens_decoded
-            else:
-                # TODO(pankaj) Figure out how to make tokenizer.decode not
-                # ignore initial whitespace so we can avoid this hack.
-                # Get string with and without previous token and diff. This hack
-                # is needed because tokenizer.decode strips initial whitespace.
-                old_string = self.tokenizer.decode(prev_token)
-                with_prev_token = np.concatenate((prev_token, current_tokens))
-                new_string = self.tokenizer.decode(with_prev_token)
-                delta = self._compute_delta(old_string, new_string)
-
-            # The previous token is the last character of the decoded sequence
-            # which includes the multi-token unicode character.
-            self._store_var(request_id, "prev_token", current_tokens)
-            self._store_var(request_id, "token_buffer", None)
-
-            # Create output tensor
-            output_tensor = pb_utils.Tensor(
-                "OUTPUT", np.array([delta]).astype(self.output_dtype)
-            )
+            # Get sequence length
+            sequence_lengths = pb_utils.get_input_tensor_by_name(
+                request, 'SEQUENCE_LENGTH').as_numpy()
 
             # Get cum log probs
-            cum_log_probs = pb_utils.get_input_tensor_by_name(request, "CUM_LOG_PROBS")
+            cum_log_probs = pb_utils.get_input_tensor_by_name(
+                request, 'CUM_LOG_PROBS')
 
             # Get sequence length
             output_log_probs = pb_utils.get_input_tensor_by_name(
-                request, "OUTPUT_LOG_PROBS"
-            )
+                request, 'OUTPUT_LOG_PROBS')
 
             # Get context logits
             context_logits = pb_utils.get_input_tensor_by_name(
-                request, "CONTEXT_LOGITS"
-            )
+                request, 'CONTEXT_LOGITS')
 
             # Get generation logits
             generation_logits = pb_utils.get_input_tensor_by_name(
-                request, "GENERATION_LOGITS"
-            )
+                request, 'GENERATION_LOGITS')
+
+            # Get the batch index
+            batch_index = pb_utils.get_input_tensor_by_name(
+                request, 'BATCH_INDEX')
+
+            # Reshape Input
+            # tokens_batch = tokens_batch.reshape([-1, tokens_batch.shape[0]])
+            # tokens_batch = tokens_batch.T
+
+            # Postprocessing output data.
+            outputs = self._postprocessing(tokens_batch, sequence_lengths)
+
+            # Create output tensors. You need pb_utils.Tensor
+            # objects to create pb_utils.InferenceResponse.
+            output_tensor = pb_utils.Tensor(
+                'OUTPUT',
+                np.array(outputs).astype(self.output_dtype))
 
             outputs = []
             outputs.append(output_tensor)
 
             if cum_log_probs:
-                out_cum_log_probs = pb_utils.Tensor(
-                    "OUT_CUM_LOG_PROBS", cum_log_probs.as_numpy()
-                )
+                out_cum_log_probs = pb_utils.Tensor('OUT_CUM_LOG_PROBS',
+                                                    cum_log_probs.as_numpy())
                 outputs.append(out_cum_log_probs)
             else:
                 out_cum_log_probs = pb_utils.Tensor(
-                    "OUT_CUM_LOG_PROBS", np.array([[0.0]], dtype=np.float32)
-                )
+                    'OUT_CUM_LOG_PROBS', np.array([[0.0]], dtype=np.float32))
                 outputs.append(out_cum_log_probs)
 
             if output_log_probs:
                 out_output_log_probs = pb_utils.Tensor(
-                    "OUT_OUTPUT_LOG_PROBS", output_log_probs.as_numpy()
-                )
+                    'OUT_OUTPUT_LOG_PROBS', output_log_probs.as_numpy())
                 outputs.append(out_output_log_probs)
             else:
                 out_output_log_probs = pb_utils.Tensor(
-                    "OUT_OUTPUT_LOG_PROBS", np.array([[[0.0]]], dtype=np.float32)
-                )
+                    'OUT_OUTPUT_LOG_PROBS',
+                    np.array([[[0.0]]], dtype=np.float32))
                 outputs.append(out_output_log_probs)
 
             if context_logits:
-                out_context_logits = pb_utils.Tensor(
-                    "OUT_CONTEXT_LOGITS", context_logits.as_numpy()
-                )
+                out_context_logits = pb_utils.Tensor('OUT_CONTEXT_LOGITS',
+                                                     context_logits.as_numpy())
                 outputs.append(out_context_logits)
             else:
                 out_context_logits = pb_utils.Tensor(
-                    "OUT_CONTEXT_LOGITS", np.array([[[0.0]]], dtype=np.float32)
-                )
+                    'OUT_CONTEXT_LOGITS', np.array([[[0.0]]],
+                                                   dtype=np.float32))
                 outputs.append(out_context_logits)
 
             if generation_logits:
                 out_generation_logits = pb_utils.Tensor(
-                    "OUT_GENERATION_LOGITS", generation_logits.as_numpy()
-                )
+                    'OUT_GENERATION_LOGITS', generation_logits.as_numpy())
                 outputs.append(out_generation_logits)
             else:
                 out_generation_logits = pb_utils.Tensor(
-                    "OUT_GENERATION_LOGITS", np.array([[[[0.0]]]], dtype=np.float32)
-                )
+                    'OUT_GENERATION_LOGITS',
+                    np.array([[[[0.0]]]], dtype=np.float32))
                 outputs.append(out_generation_logits)
 
-            inference_response = pb_utils.InferenceResponse(output_tensors=outputs)
+            if batch_index:
+                out_batch_index = pb_utils.Tensor('OUT_BATCH_INDEX',
+                                                  batch_index.as_numpy())
+                outputs.append(out_batch_index)
+            else:
+                out_batch_index = pb_utils.Tensor(
+                    'OUT_BATCH_INDEX', np.array([[0]], dtype=np.int32))
+                outputs.append(out_batch_index)
+
+            # Create InferenceResponse. You can set an error here in case
+            # there was a problem with handling this inference request.
+            # Below is an example of how you can set errors in inference
+            # response:
+            #
+            # pb_utils.InferenceResponse(
+            #    output_tensors=..., TritonError("An error occurred"))
+            inference_response = pb_utils.InferenceResponse(
+                output_tensors=outputs)
             responses.append(inference_response)
 
+        # You should return a list of pb_utils.InferenceResponse. Length
+        # of this list must match the length of `requests` list.
         return responses
 
     def finalize(self):
-        print("Cleaning up...")
+        """`finalize` is called only once when the model is being unloaded.
+        Implementing `finalize` function is optional. This function allows
+        the model to perform any necessary clean ups before exit.
+        """
+        print('Cleaning up...')
 
-    def _store_var(self, request_id, var_name, var):
-        if request_id in self.state_dict:
-            self.state_dict[request_id][var_name] = var
-            self.state_dict.move_to_end(request_id)
-        else:
-            if len(self.state_dict) > self.cache_size:
-                self.state_dict.popitem(last=False)
-            self.state_dict[request_id] = {"prev_token": None, "token_buffer": None}
-            self.state_dict[request_id][var_name] = var
-
-    def _get_var(self, request_id, var_name):
-        if request_id in self.state_dict:
-            return self.state_dict[request_id][var_name]
-        return None
-
-    def _compute_delta(self, prev_str, new_str):
-        delta = "".join(
-            [
-                char
-                for index, char in enumerate(new_str)
-                if index >= len(prev_str) or char != prev_str[index]
-            ]
-        )
-        return delta
-
-    def _postprocessing(self, tokens):
-        decoded_tokens = self.tokenizer.decode(tokens)
-        return decoded_tokens
+    def _postprocessing(self, tokens_batch, sequence_lengths):
+        outputs = []
+        for batch_idx, beam_tokens in enumerate(tokens_batch):
+            for beam_idx, tokens in enumerate(beam_tokens):
+                seq_len = sequence_lengths[batch_idx][beam_idx]
+                # Exclude fake ids in multimodal models
+                fake_id_len = 0
+                for i in range(seq_len):
+                    if tokens[i] < self.tokenizer.vocab_size:
+                        fake_id_len = i
+                        break
+                output = self.tokenizer.decode(
+                    tokens[fake_id_len:seq_len],
+                    skip_special_tokens=self.skip_special_tokens)
+                outputs.append(output.encode('utf8'))
+        return outputs
