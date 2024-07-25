@@ -31,21 +31,21 @@ class Model:
         self.uses_openai_api = None
 
     def load(self):
-        trtllm_config = self._config.get("trt_llm", {})
-        self.uses_openai_api = OPENAI_COMPATIBLE_TAG in self._config.get(
-            "model_metadata", {}
-        ).get("tags", [])
-        hf_access_token = None
-        if "hf_access_token" in self._secrets._base_secrets.keys():
-            hf_access_token = self._secrets["hf_access_token"]
+        # trtllm_config = self._config.get("trt_llm", {})
+        # self.uses_openai_api = OPENAI_COMPATIBLE_TAG in self._config.get(
+        #    "model_metadata", {}
+        # ).get("tags", [])
+        hf_access_token = ""
+        # if "hf_access_token" in self._secrets._base_secrets.keys():
+        #    hf_access_token = self._secrets["hf_access_token"]
 
-        engine_repository_path = self._data_dir
-        truss_trtllm_build_config = TrussTRTLLMBuildConfiguration(
-            **trtllm_config.get("build")
-        )
-        tokenizer_repository = truss_trtllm_build_config.checkpoint_repository.repo
-        tensor_parallel_count = truss_trtllm_build_config.tensor_parallel_count
-        pipeline_parallel_count = truss_trtllm_build_config.pipeline_parallel_count
+        # engine_repository_path = self._data_dir
+        # truss_trtllm_build_config = TrussTRTLLMBuildConfiguration(
+        #    **trtllm_config.get("build")
+        #)
+        tokenizer_repository = "meta-llama/Meta-Llama-3.1-405B-FP8"
+        tensor_parallel_count = 8
+        pipeline_parallel_count = 1
         world_size = tensor_parallel_count * pipeline_parallel_count
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -55,23 +55,23 @@ class Model:
 
         # Set up Triton Server
         env = {}
-        if hf_access_token:
-            env[HF_AUTH_KEY_CONSTANT] = hf_access_token
+        # if hf_access_token:
+        #    env[HF_AUTH_KEY_CONSTANT] = hf_access_token
         env[TOKENIZER_KEY_CONSTANT] = tokenizer_repository
 
         self.triton_server = TritonServer(
-            grpc_port=GRPC_SERVICE_PORT,
-            http_port=HTTP_SERVICE_PORT,
+            grpc_port=8001,
+            http_port=8002,
         )
-        self.triton_server.create_model_repository(
-            truss_data_dir=self._data_dir,
-            engine_repository_path=engine_repository_path,
-            huggingface_auth_token=hf_access_token,
-        )
-        self.triton_server.start(
-            world_size=world_size,
-            env=env,
-        )
+        # self.triton_server.create_model_repository(
+        #    truss_data_dir=self._data_dir,
+        #    engine_repository_path=engine_repository_path,
+        #    huggingface_auth_token=hf_access_token,
+        # )
+        # self.triton_server.start(
+        #    world_size=world_size,
+        #    env=env,
+        #)
         self.triton_client = TritonClient(
             grpc_service_port=GRPC_SERVICE_PORT,
         )
@@ -108,7 +108,7 @@ class Model:
                 full_text += delta
             return full_text
 
-        if model_input.stream:
+        if model_input._stream:
             return generate()
         else:
             text = await build_response()
