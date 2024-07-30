@@ -35,7 +35,7 @@ class Model:
         # self.uses_openai_api = OPENAI_COMPATIBLE_TAG in self._config.get(
         #    "model_metadata", {}
         # ).get("tags", [])
-        hf_access_token = ""
+        hf_access_token = "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"
         # if "hf_access_token" in self._secrets._base_secrets.keys():
         #    hf_access_token = self._secrets["hf_access_token"]
 
@@ -43,8 +43,8 @@ class Model:
         # truss_trtllm_build_config = TrussTRTLLMBuildConfiguration(
         #    **trtllm_config.get("build")
         #)
-        tokenizer_repository = "meta-llama/Meta-Llama-3.1-405B-FP8"
-        tensor_parallel_count = 8
+        tokenizer_repository = "meta-llama/Meta-Llama-3.1-70B-Instruct"
+        tensor_parallel_count = 4
         pipeline_parallel_count = 1
         world_size = tensor_parallel_count * pipeline_parallel_count
 
